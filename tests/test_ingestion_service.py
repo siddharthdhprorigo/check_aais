@@ -161,7 +161,7 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
     assert len(data_source_queries) == 1
     assert all(query == "tenant-a/kb-b" for query in data_source_queries.values())
 
-    assert len(indexer_client.skillsets) == 3
+    assert len(indexer_client.skillsets) == 1
     assert blob_container_client.metadata_updates == [
         (
             "tenant-a/kb-b/12345",
@@ -225,7 +225,7 @@ def test_second_kb_for_same_tenant_reuses_same_tenant_index():
 
     assert first["index_name"] == second["index_name"]
     assert len(index_client.indexes) == 1
-    assert len(indexer_client.skillsets) == 3
+    assert len(indexer_client.skillsets) == 1
 
 
 def test_different_tenants_get_different_indexes():
@@ -363,6 +363,7 @@ def test_get_ingestion_status_reads_azure_search_status_only():
         item["indexer_name"]: item["status"] for item in result["indexers"]
     }
     assert found[active_indexer_name] == "inProgress"
+    assert list(found.values()).count("not_found") == 2
 
 
 def test_get_ingestion_status_reports_missing_indexers():

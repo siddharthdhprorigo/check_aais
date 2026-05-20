@@ -20,7 +20,6 @@ from azure.search.documents.indexes.models import (
     InputFieldMappingEntry,
     NativeBlobSoftDeleteDeletionDetectionPolicy,
     OutputFieldMappingEntry,
-    SearchField,
     SearchFieldDataType,
     SearchIndex,
     SearchIndexer,
@@ -150,16 +149,10 @@ class AzureSearchIngestionService:
         tenant_resources = self._tenant_resource_names(normalized_tenant)
         tenant_index_name = tenant_resources["index_name"]
         self._ensure_tenant_index(tenant_index_name)
-        self.search_indexer_client.create_or_update_skillset(
-            self._build_layout_skillset(tenant_resources["layout_skillset_name"], tenant_index_name)
-        )
-        self.search_indexer_client.create_or_update_skillset(
-            self._build_text_skillset(tenant_resources["text_skillset_name"], tenant_index_name)
-        )
-        self.search_indexer_client.create_or_update_skillset(
-            self._build_mixed_skillset(
-                tenant_resources["mixed_skillset_name"], tenant_index_name
-            )
+        active_skillset_name = self._ensure_pipeline_skillset(
+            pipeline,
+            tenant_resources,
+            tenant_index_name,
         )
         self._stamp_blob_metadata(
             normalized_tenant,
@@ -172,9 +165,7 @@ class AzureSearchIngestionService:
             blob_prefix,
             pipeline=pipeline,
             tenant_index_name=tenant_index_name,
-            layout_skillset_name=tenant_resources["layout_skillset_name"],
-            text_skillset_name=tenant_resources["text_skillset_name"],
-            mixed_skillset_name=tenant_resources["mixed_skillset_name"],
+            active_skillset_name=active_skillset_name,
         )
 
         started_at = _utc_now_iso()
@@ -206,6 +197,7 @@ class AzureSearchIngestionService:
         for doc_group, indexer_name in (
             ("layout", names["layout_indexer_name"]),
             ("text", names["text_indexer_name"]),
+            ("mixed", names["mixed_indexer_name"]),
         ):
             statuses.append(
                 {
@@ -241,25 +233,23 @@ class AzureSearchIngestionService:
         *,
         pipeline: str,
         tenant_index_name: str,
-        layout_skillset_name: str,
-        text_skillset_name: str,
-        mixed_skillset_name: str,
+        active_skillset_name: str,
     ) -> list[dict[str, Any]]:
         names = self._runtime_resource_names(tenant_id, kb_id)
         if pipeline == "layout":
             return [
                 {
-                "kind": "layout",
-                "data_source": self._build_runtime_data_source(
-                    names["layout_data_source_name"], blob_prefix
-                ),
-                "indexer": self._build_runtime_indexer(
-                    names["layout_indexer_name"],
-                    names["layout_data_source_name"],
-                    layout_skillset_name,
-                    tenant_index_name,
-                    allow_skillset_to_read_file_data=True,
-                ),
+                    "kind": "layout",
+                    "data_source": self._build_runtime_data_source(
+                        names["layout_data_source_name"], blob_prefix
+                    ),
+                    "indexer": self._build_runtime_indexer(
+                        names["layout_indexer_name"],
+                        names["layout_data_source_name"],
+                        active_skillset_name,
+                        tenant_index_name,
+                        allow_skillset_to_read_file_data=True,
+                    ),
                 }
             ]
         if pipeline == "mixed":
@@ -272,7 +262,7 @@ class AzureSearchIngestionService:
                     "indexer": self._build_runtime_indexer(
                         names["mixed_indexer_name"],
                         names["mixed_data_source_name"],
-                        mixed_skillset_name,
+                        active_skillset_name,
                         tenant_index_name,
                         allow_skillset_to_read_file_data=True,
                     ),
@@ -287,7 +277,7 @@ class AzureSearchIngestionService:
                 "indexer": self._build_runtime_indexer(
                     names["text_indexer_name"],
                     names["text_data_source_name"],
-                    text_skillset_name,
+                    active_skillset_name,
                     tenant_index_name,
                     allow_skillset_to_read_file_data=False,
                 ),
@@ -429,6 +419,24 @@ class AzureSearchIngestionService:
             )
 
         self.index_client.create_or_update_index(desired_index)
+
+    def _ensure_pipeline_skillset(
+        self,
+        pipeline: str,
+        tenant_resources: dict[str, str],
+        tenant_index_name: str,
+    ) -> str:
+        if pipeline == "layout":
+            skillset_name = tenant_resources["layout_skillset_name"]
+            skillset = self._build_layout_skillset(skillset_name, tenant_index_name)
+        elif pipeline == "mixed":
+            skillset_name = tenant_resources["mixed_skillset_name"]
+            skillset = self._build_mixed_skillset(skillset_name, tenant_index_name)
+        else:
+            skillset_name = tenant_resources["text_skillset_name"]
+            skillset = self._build_text_skillset(skillset_name, tenant_index_name)
+        self.search_indexer_client.create_or_update_skillset(skillset)
+        return skillset_name
 
     def _build_layout_skillset(
         self, skillset_name: str, target_index_name: str
