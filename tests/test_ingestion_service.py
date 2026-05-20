@@ -161,7 +161,7 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
     assert len(data_source_queries) == 1
     assert all(query == "tenant-a/kb-b" for query in data_source_queries.values())
 
-    assert len(indexer_client.skillsets) == 2
+    assert len(indexer_client.skillsets) == 3
     assert blob_container_client.metadata_updates == [
         (
             "tenant-a/kb-b/12345",
@@ -225,7 +225,7 @@ def test_second_kb_for_same_tenant_reuses_same_tenant_index():
 
     assert first["index_name"] == second["index_name"]
     assert len(index_client.indexes) == 1
-    assert len(indexer_client.skillsets) == 2
+    assert len(indexer_client.skillsets) == 3
 
 
 def test_different_tenants_get_different_indexes():
@@ -289,22 +289,47 @@ def test_start_ingestion_fails_when_file_map_does_not_match_kb_blobs():
     assert indexer_client.ran_indexers == []
 
 
-def test_start_ingestion_rejects_mixed_layout_and_text_file_types():
-    service, _, indexer_client, _, _ = build_service(
+def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
+    service, _, indexer_client, index_client, blob_container_client = build_service(
         blob_names=[
             "tenant-a/kb-a/12345",
             "tenant-a/kb-a/98765",
         ]
     )
 
-    with pytest.raises(ValueError, match="Mixed layout and text file types"):
-        service.start_ingestion(
-            "tenant-a",
-            "kb-a",
-            {"12345": "doc.pdf", "98765": "notes.txt"},
-        )
+    result = service.start_ingestion(
+        "tenant-a",
+        "kb-a",
+        {"12345": "doc.pdf", "98765": "notes.txt"},
+    )
 
-    assert indexer_client.ran_indexers == []
+    assert result["pipeline"] == "mixed"
+    assert result["index_name"] in index_client.indexes
+    assert len(result["indexer_names"]) == 1
+    assert len(indexer_client.ran_indexers) == 1
+    mixed_indexer = next(iter(indexer_client.indexers.values()))
+    assert "mixed" in mixed_indexer.name
+    assert mixed_indexer.parameters.configuration.allow_skillset_to_read_file_data is True
+    assert blob_container_client.metadata_updates == [
+        (
+            "tenant-a/kb-a/12345",
+            {
+                "filename": "doc.pdf",
+                "file_id": "12345",
+                "tenant_id": "tenant-a",
+                "kb_id": "kb-a",
+            },
+        ),
+        (
+            "tenant-a/kb-a/98765",
+            {
+                "filename": "notes.txt",
+                "file_id": "98765",
+                "tenant_id": "tenant-a",
+                "kb_id": "kb-a",
+            },
+        ),
+    ]
 
 
 def test_get_ingestion_status_reads_azure_search_status_only():

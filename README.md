@@ -24,7 +24,7 @@ Because blob names are extensionless `file_id` values, the service chooses the A
 
 - layout family: `.pdf`, `.docx`, `.html`
 - text family: `.txt`, `.md`
-- mixed layout and text families in the same KB ingestion are rejected in v1
+- mixed layout and text families use a mixed extraction pipeline in Azure AI Search
 
 ## Input contract
 
@@ -49,6 +49,7 @@ All files in a single request must belong to the same Azure AI Search pipeline f
 
 - layout family: `.pdf`, `.docx`, `.html`
 - text family: `.txt`, `.md`
+- mixed family: any combination across those two sets, handled through `DocumentExtractionSkill -> SplitSkill`
 
 Before Azure AI Search runs, it verifies that the blobs under:
 
@@ -73,6 +74,11 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 - `TXT` and `MD`
   - Parsed by the blob indexer
   - Chunked by Azure AI Search using `SplitSkill`
+
+- Mixed `PDF`/`DOCX`/`HTML` with `TXT`/`MD`
+  - Parsed by Azure AI Search using `DocumentExtractionSkill`
+  - Chunked by Azure AI Search using `SplitSkill`
+  - Trades away page metadata in favor of supporting mixed file types in one KB ingestion
 
 ## Metadata preserved in each tenant index
 

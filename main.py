@@ -13,6 +13,7 @@ from azure.identity import DefaultAzureCredential
 from azure.search.documents.indexes import SearchIndexClient, SearchIndexerClient
 from azure.search.documents.indexes.models import (
     AIServicesAccountKey,
+    DocumentExtractionSkill,
     IndexProjectionMode,
     IndexingParameters,
     IndexingParametersConfiguration,
@@ -155,6 +156,11 @@ class AzureSearchIngestionService:
         self.search_indexer_client.create_or_update_skillset(
             self._build_text_skillset(tenant_resources["text_skillset_name"], tenant_index_name)
         )
+        self.search_indexer_client.create_or_update_skillset(
+            self._build_mixed_skillset(
+                tenant_resources["mixed_skillset_name"], tenant_index_name
+            )
+        )
         self._stamp_blob_metadata(
             normalized_tenant,
             normalized_kb,
@@ -168,6 +174,7 @@ class AzureSearchIngestionService:
             tenant_index_name=tenant_index_name,
             layout_skillset_name=tenant_resources["layout_skillset_name"],
             text_skillset_name=tenant_resources["text_skillset_name"],
+            mixed_skillset_name=tenant_resources["mixed_skillset_name"],
         )
 
         started_at = _utc_now_iso()
@@ -236,6 +243,7 @@ class AzureSearchIngestionService:
         tenant_index_name: str,
         layout_skillset_name: str,
         text_skillset_name: str,
+        mixed_skillset_name: str,
     ) -> list[dict[str, Any]]:
         names = self._runtime_resource_names(tenant_id, kb_id)
         if pipeline == "layout":
@@ -252,6 +260,22 @@ class AzureSearchIngestionService:
                     tenant_index_name,
                     allow_skillset_to_read_file_data=True,
                 ),
+                }
+            ]
+        if pipeline == "mixed":
+            return [
+                {
+                    "kind": "mixed",
+                    "data_source": self._build_runtime_data_source(
+                        names["mixed_data_source_name"], blob_prefix
+                    ),
+                    "indexer": self._build_runtime_indexer(
+                        names["mixed_indexer_name"],
+                        names["mixed_data_source_name"],
+                        mixed_skillset_name,
+                        tenant_index_name,
+                        allow_skillset_to_read_file_data=True,
+                    ),
                 }
             ]
         return [
@@ -458,6 +482,42 @@ class AzureSearchIngestionService:
             index_projection=self._build_text_index_projection(target_index_name),
         )
 
+    def _build_mixed_skillset(
+        self, skillset_name: str, target_index_name: str
+    ) -> SearchIndexerSkillset:
+        extraction_skill = DocumentExtractionSkill(
+            name="extract-mixed-document-text",
+            description="Extract text from mixed document types before chunking.",
+            context="/document",
+            data_to_extract="contentAndMetadata",
+            inputs=[InputFieldMappingEntry(name="file_data", source="/document/file_data")],
+            outputs=[
+                OutputFieldMappingEntry(name="content", target_name="extracted_content")
+            ],
+        )
+        split_skill = SplitSkill(
+            name="split-mixed-document-text",
+            description="Chunk extracted text for mixed document ingestion.",
+            context="/document",
+            default_language_code=self.config.default_language_code,
+            text_split_mode="pages",
+            maximum_page_length=self.config.chunk_size,
+            page_overlap_length=self.config.chunk_overlap,
+            inputs=[
+                InputFieldMappingEntry(name="text", source="/document/extracted_content")
+            ],
+            outputs=[
+                OutputFieldMappingEntry(name="textItems", target_name="pages"),
+                OutputFieldMappingEntry(name="ordinalPositions"),
+            ],
+        )
+        return SearchIndexerSkillset(
+            name=skillset_name,
+            description="Tenant-scoped skillset for mixed file type chunking.",
+            skills=[extraction_skill, split_skill],
+            index_projection=self._build_text_index_projection(target_index_name),
+        )
+
     def _build_layout_index_projection(
         self, target_index_name: str
     ) -> SearchIndexerIndexProjection:
@@ -616,6 +676,9 @@ class AzureSearchIngestionService:
             "text_skillset_name": (
                 f"{self.config.skillset_name_prefix}-text-{tenant_slug}"
             ),
+            "mixed_skillset_name": (
+                f"{self.config.skillset_name_prefix}-mixed-{tenant_slug}"
+            ),
         }
 
     def _runtime_resource_names(self, tenant_id: str, kb_id: str) -> dict[str, str]:
@@ -625,8 +688,10 @@ class AzureSearchIngestionService:
                 f"{self.config.data_source_name_prefix}-layout-{slug}"
             ),
             "text_data_source_name": f"{self.config.data_source_name_prefix}-text-{slug}",
+            "mixed_data_source_name": f"{self.config.data_source_name_prefix}-mixed-{slug}",
             "layout_indexer_name": f"{self.config.indexer_name_prefix}-layout-{slug}",
             "text_indexer_name": f"{self.config.indexer_name_prefix}-text-{slug}",
+            "mixed_indexer_name": f"{self.config.indexer_name_prefix}-mixed-{slug}",
         }
 
     def _read_indexer_status(self, indexer_name: str) -> dict[str, Any]:
@@ -715,11 +780,7 @@ def _select_ingestion_pipeline(file_map: dict[str, str]) -> str:
     has_layout_files = any(ext in LAYOUT_FILE_EXTENSIONS for ext in file_extensions)
     has_text_files = any(ext in TEXT_FILE_EXTENSIONS for ext in file_extensions)
     if has_layout_files and has_text_files:
-        raise ValueError(
-            "Mixed layout and text file types in one KB ingestion are not supported "
-            "when blob names are extensionless file_ids. Split the KB by file type "
-            "or include the real extension in the blob name."
-        )
+        return "mixed"
     return "layout" if has_layout_files else "text"
 
 
