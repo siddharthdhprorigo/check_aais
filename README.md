@@ -1,6 +1,6 @@
 # Azure AI Search KB-Scoped Ingestion POC
 
-This POC provisions an Azure AI Search ingestion pipeline that keeps parsing and chunking inside Azure AI Search.
+This POC provisions an Azure AI Search ingestion pipeline that keeps parsing, chunking, and vector embedding generation inside Azure AI Search.
 
 It supports KB-scoped ingestion for blobs stored under:
 
@@ -17,6 +17,7 @@ where the blob name is the `file_id`, not the original filename.
 - Tenant-scoped skillsets created lazily on first ingestion for that tenant
 - KB-scoped runtime data sources and indexers for each ingestion request
 - Blob metadata stamping before indexing so Azure AI Search can ingest `filename`, `file_id`, `tenant_id`, and `kb_id`
+- Azure OpenAI-powered vector embeddings persisted per chunk in the tenant index
 
 All KBs for the same tenant land in the same tenant index.
 
@@ -80,6 +81,13 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
   - Chunked by Azure AI Search using `SplitSkill`
   - Trades away page metadata in favor of supporting mixed file types in one KB ingestion
 
+## Vector search readiness
+
+- Every chunk's `content` is embedded during indexing with `AzureOpenAIEmbeddingSkill`
+- The embedding is stored in `content_vector` on the tenant index
+- The tenant index is provisioned with Azure AI Search vector search configuration and an Azure OpenAI vectorizer
+- Downstream applications can use the index for vector similarity or hybrid keyword-plus-vector retrieval in RAG workflows
+
 ## Metadata preserved in each tenant index
 
 - `chunk_id`
@@ -92,6 +100,7 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 - `chunk_ordinal`
 - `page_number` when available
 - `source_type`
+- `content_vector`
 
 ## Required environment variables
 
@@ -99,6 +108,9 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 AZURE_BLOB_CONNECTION_STRING=
 AZURE_BLOB_CONTAINER_NAME=
 AZURE_SEARCH_SERVICE_ENDPOINT=
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=
+AZURE_OPENAI_EMBEDDING_DIMENSIONS=
 ```
 
 ## Optional environment variables
@@ -117,6 +129,8 @@ AZURE_AI_SERVICES_SUBDOMAIN_URL=
 ```
 
 `AZURE_AI_SERVICES_KEY` and `AZURE_AI_SERVICES_SUBDOMAIN_URL` are only needed when your Document Layout skill billing setup uses an attached Azure AI / Foundry resource key.
+
+`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, and `AZURE_OPENAI_EMBEDDING_DIMENSIONS` are required so Azure AI Search can generate and persist chunk embeddings in the tenant index.
 
 ## Commands
 

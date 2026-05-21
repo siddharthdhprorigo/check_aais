@@ -7,6 +7,8 @@ import pytest
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from main import (
+    CONTENT_VECTOR_FIELD_NAME,
+    VECTOR_SEARCH_PROFILE_NAME,
     AzureSearchIngestionConfig,
     AzureSearchIngestionService,
     _load_file_map_from_path,
@@ -108,6 +110,9 @@ def build_service(blob_names=None):
         search_endpoint="https://example.search.windows.net",
         blob_connection_string="UseDevelopmentStorage=true",
         blob_container_name="docs",
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_embedding_deployment="embeddings",
+        azure_openai_embedding_dimensions=1536,
     )
     indexer_client = FakeIndexerClient()
     index_client = FakeIndexClient()
@@ -191,6 +196,29 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
 
     assert layout_indexer.target_index_name == result["index_name"]
     assert layout_indexer.parameters.configuration.allow_skillset_to_read_file_data is True
+    tenant_index = index_client.indexes[result["index_name"]]
+    vector_field = next(
+        field for field in tenant_index.fields if field.name == CONTENT_VECTOR_FIELD_NAME
+    )
+    assert str(vector_field.type) == "Collection(Edm.Single)"
+    assert vector_field.vector_search_dimensions == 1536
+    assert vector_field.vector_search_profile_name == VECTOR_SEARCH_PROFILE_NAME
+    assert tenant_index.vector_search is not None
+    assert tenant_index.vector_search.profiles[0].name == VECTOR_SEARCH_PROFILE_NAME
+
+    skillset = next(iter(indexer_client.skillsets.values()))
+    embedding_skill = next(
+        skill for skill in skillset.skills if skill.name == "layout-content-embeddings"
+    )
+    assert embedding_skill.context == "/document/text_sections/*"
+    assert embedding_skill.inputs[0].source == "/document/text_sections/*/content"
+    assert embedding_skill.outputs[0].target_name == "chunk_vector"
+    vector_mapping = next(
+        mapping
+        for mapping in skillset.index_projection.selectors[0].mappings
+        if mapping.name == CONTENT_VECTOR_FIELD_NAME
+    )
+    assert vector_mapping.source == "/document/text_sections/*/chunk_vector"
 
 
 def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
@@ -210,6 +238,19 @@ def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
     text_indexer = next(iter(indexer_client.indexers.values()))
     assert text_indexer.target_index_name == result["index_name"]
     assert text_indexer.parameters.configuration.allow_skillset_to_read_file_data is False
+    skillset = next(iter(indexer_client.skillsets.values()))
+    embedding_skill = next(
+        skill for skill in skillset.skills if skill.name == "text-content-embeddings"
+    )
+    assert embedding_skill.context == "/document/pages/*"
+    assert embedding_skill.inputs[0].source == "/document/pages/*"
+    assert embedding_skill.outputs[0].target_name == "chunk_vector"
+    vector_mapping = next(
+        mapping
+        for mapping in skillset.index_projection.selectors[0].mappings
+        if mapping.name == CONTENT_VECTOR_FIELD_NAME
+    )
+    assert vector_mapping.source == "/document/pages/*/chunk_vector"
 
 
 def test_second_kb_for_same_tenant_reuses_same_tenant_index():
@@ -252,6 +293,34 @@ def test_start_ingestion_fails_fast_for_incompatible_existing_index_schema():
     for field in incompatible_index.fields:
         if field.name == "chunk_ordinal":
             field.type = "Edm.Int32"
+    index_client.indexes[incompatible_index.name] = incompatible_index
+
+    with pytest.raises(ValueError, match="Delete and recreate index"):
+        service.start_ingestion("tenant-a", "kb-a", {"12345": "doc.pdf"})
+
+
+def test_start_ingestion_fails_fast_for_existing_index_without_vector_search():
+    service, _, _, index_client, _ = build_service(
+        blob_names=["tenant-a/kb-a/12345"]
+    )
+    incompatible_index = service._build_index("kb-chunks-tenant-a-placeholder")
+    incompatible_index.name = service._tenant_resource_names("tenant-a")["index_name"]
+    incompatible_index.vector_search = None
+    index_client.indexes[incompatible_index.name] = incompatible_index
+
+    with pytest.raises(ValueError, match="Delete and recreate index"):
+        service.start_ingestion("tenant-a", "kb-a", {"12345": "doc.pdf"})
+
+
+def test_start_ingestion_fails_fast_for_existing_index_with_wrong_vector_dimensions():
+    service, _, _, index_client, _ = build_service(
+        blob_names=["tenant-a/kb-a/12345"]
+    )
+    incompatible_index = service._build_index("kb-chunks-tenant-a-placeholder")
+    incompatible_index.name = service._tenant_resource_names("tenant-a")["index_name"]
+    for field in incompatible_index.fields:
+        if field.name == CONTENT_VECTOR_FIELD_NAME:
+            field.vector_search_dimensions = 3072
     index_client.indexes[incompatible_index.name] = incompatible_index
 
     with pytest.raises(ValueError, match="Delete and recreate index"):
@@ -310,6 +379,19 @@ def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
     mixed_indexer = next(iter(indexer_client.indexers.values()))
     assert "mixed" in mixed_indexer.name
     assert mixed_indexer.parameters.configuration.allow_skillset_to_read_file_data is True
+    skillset = next(iter(indexer_client.skillsets.values()))
+    embedding_skill = next(
+        skill for skill in skillset.skills if skill.name == "mixed-content-embeddings"
+    )
+    assert embedding_skill.context == "/document/pages/*"
+    assert embedding_skill.inputs[0].source == "/document/pages/*"
+    assert embedding_skill.outputs[0].target_name == "chunk_vector"
+    vector_mapping = next(
+        mapping
+        for mapping in skillset.index_projection.selectors[0].mappings
+        if mapping.name == CONTENT_VECTOR_FIELD_NAME
+    )
+    assert vector_mapping.source == "/document/pages/*/chunk_vector"
     assert blob_container_client.metadata_updates == [
         (
             "tenant-a/kb-a/12345",

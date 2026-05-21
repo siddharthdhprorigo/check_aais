@@ -13,7 +13,11 @@ from azure.identity import DefaultAzureCredential
 from azure.search.documents.indexes import SearchIndexClient, SearchIndexerClient
 from azure.search.documents.indexes.models import (
     AIServicesAccountKey,
+    AzureOpenAIEmbeddingSkill,
+    AzureOpenAIVectorizer,
+    AzureOpenAIVectorizerParameters,
     DocumentExtractionSkill,
+    HnswAlgorithmConfiguration,
     IndexProjectionMode,
     IndexingParameters,
     IndexingParametersConfiguration,
@@ -29,9 +33,12 @@ from azure.search.documents.indexes.models import (
     SearchIndexerIndexProjectionSelector,
     SearchIndexerIndexProjectionsParameters,
     SearchIndexerSkillset,
+    SearchField,
     SearchableField,
     SimpleField,
     SplitSkill,
+    VectorSearch,
+    VectorSearchProfile,
     DocumentIntelligenceLayoutSkill,
 )
 from azure.storage.blob import ContainerClient
@@ -41,6 +48,10 @@ load_dotenv()
 
 LAYOUT_FILE_EXTENSIONS = {".pdf", ".docx", ".html"}
 TEXT_FILE_EXTENSIONS = {".txt", ".md"}
+CONTENT_VECTOR_FIELD_NAME = "content_vector"
+VECTOR_SEARCH_PROFILE_NAME = "content-vector-profile"
+VECTOR_SEARCH_ALGORITHM_NAME = "content-vector-hnsw"
+VECTOR_SEARCH_VECTORIZER_NAME = "content-vectorizer"
 
 
 @dataclass(slots=True)
@@ -58,12 +69,22 @@ class AzureSearchIngestionConfig:
     default_language_code: str = "en"
     ai_services_key: str | None = None
     ai_services_subdomain_url: str | None = None
+    azure_openai_endpoint: str = ""
+    azure_openai_embedding_deployment: str = ""
+    azure_openai_embedding_dimensions: int = 0
 
     @classmethod
     def from_env(cls) -> "AzureSearchIngestionConfig":
         search_endpoint = _required_env("AZURE_SEARCH_SERVICE_ENDPOINT")
         blob_connection_string = _required_env("AZURE_BLOB_CONNECTION_STRING")
         blob_container_name = _required_env("AZURE_BLOB_CONTAINER_NAME")
+        azure_openai_endpoint = _required_env("AZURE_OPENAI_ENDPOINT")
+        azure_openai_embedding_deployment = _required_env(
+            "AZURE_OPENAI_EMBEDDING_DEPLOYMENT"
+        )
+        azure_openai_embedding_dimensions = int(
+            _required_env("AZURE_OPENAI_EMBEDDING_DIMENSIONS")
+        )
         chunk_size = int(os.getenv("AZURE_SEARCH_CHUNK_SIZE", "2000"))
         chunk_overlap = int(os.getenv("AZURE_SEARCH_CHUNK_OVERLAP", "500"))
         if chunk_overlap >= (chunk_size / 2):
@@ -97,6 +118,9 @@ class AzureSearchIngestionConfig:
             ),
             ai_services_key=os.getenv("AZURE_AI_SERVICES_KEY"),
             ai_services_subdomain_url=os.getenv("AZURE_AI_SERVICES_SUBDOMAIN_URL"),
+            azure_openai_endpoint=azure_openai_endpoint,
+            azure_openai_embedding_deployment=azure_openai_embedding_deployment,
+            azure_openai_embedding_dimensions=azure_openai_embedding_dimensions,
         )
 
 
@@ -132,6 +156,8 @@ class AzureSearchIngestionService:
             "shared_data_source_name": self.config.shared_data_source_name,
             "tenant_index_name_prefix": self.config.index_name_prefix,
             "tenant_skillset_name_prefix": self.config.skillset_name_prefix,
+            "vector_field_name": CONTENT_VECTOR_FIELD_NAME,
+            "vector_search_profile_name": VECTOR_SEARCH_PROFILE_NAME,
             "note": (
                 "Tenant indexes and tenant-scoped skillsets are created lazily on the "
                 "first ingestion for a tenant."
@@ -367,6 +393,13 @@ class AzureSearchIngestionService:
                 name="content",
                 type=SearchFieldDataType.STRING,
             ),
+            SearchField(
+                name=CONTENT_VECTOR_FIELD_NAME,
+                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                searchable=True,
+                vector_search_dimensions=self.config.azure_openai_embedding_dimensions,
+                vector_search_profile_name=VECTOR_SEARCH_PROFILE_NAME,
+            ),
             SimpleField(
                 name="chunk_ordinal",
                 type=SearchFieldDataType.STRING,
@@ -386,7 +419,11 @@ class AzureSearchIngestionService:
                 sortable=True,
             ),
         ]
-        return SearchIndex(name=index_name, fields=fields)
+        return SearchIndex(
+            name=index_name,
+            fields=fields,
+            vector_search=self._build_vector_search(),
+        )
 
     def _ensure_tenant_index(self, index_name: str) -> None:
         desired_index = self._build_index(index_name)
@@ -407,11 +444,28 @@ class AzureSearchIngestionService:
             for field_name, desired_type in desired_fields.items()
             if field_name in existing_fields and existing_fields[field_name] != desired_type
         ]
+        incompatible_field_configs = self._find_incompatible_field_configurations(
+            existing_index, desired_index
+        )
+        vector_search_mismatch = self._vector_search_configuration_mismatch(
+            existing_index, desired_index
+        )
         if incompatible_fields:
             details = ", ".join(
                 f"{field_name}: existing={existing_fields[field_name]} desired={desired_fields[field_name]}"
                 for field_name in incompatible_fields
             )
+            raise ValueError(
+                "Tenant index schema is incompatible with the current code. "
+                f"Delete and recreate index '{index_name}' before re-running ingestion. "
+                f"Incompatible fields: {details}"
+            )
+        if incompatible_field_configs or vector_search_mismatch:
+            details = ", ".join(incompatible_field_configs)
+            if vector_search_mismatch:
+                details = ", ".join(
+                    part for part in [details, "vector_search: existing configuration does not match desired configuration"] if part
+                )
             raise ValueError(
                 "Tenant index schema is incompatible with the current code. "
                 f"Delete and recreate index '{index_name}' before re-running ingestion. "
@@ -458,10 +512,16 @@ class AzureSearchIngestionService:
                 OutputFieldMappingEntry(name="text_sections", target_name="text_sections")
             ],
         )
+        embedding_skill = self._build_embedding_skill(
+            name="layout-content-embeddings",
+            context="/document/text_sections/*",
+            source="/document/text_sections/*/content",
+            target_name="chunk_vector",
+        )
         return SearchIndexerSkillset(
             name=skillset_name,
             description="Tenant-scoped skillset for PDF/DOCX parsing and chunking.",
-            skills=[layout_skill],
+            skills=[layout_skill, embedding_skill],
             index_projection=self._build_layout_index_projection(target_index_name),
             cognitive_services_account=self._build_cognitive_services_account(),
         )
@@ -483,10 +543,16 @@ class AzureSearchIngestionService:
                 OutputFieldMappingEntry(name="ordinalPositions"),
             ],
         )
+        embedding_skill = self._build_embedding_skill(
+            name="text-content-embeddings",
+            context="/document/pages/*",
+            source="/document/pages/*",
+            target_name="chunk_vector",
+        )
         return SearchIndexerSkillset(
             name=skillset_name,
             description="Tenant-scoped skillset for TXT/MD/HTML chunking.",
-            skills=[split_skill],
+            skills=[split_skill, embedding_skill],
             index_projection=self._build_text_index_projection(target_index_name),
         )
 
@@ -519,10 +585,16 @@ class AzureSearchIngestionService:
                 OutputFieldMappingEntry(name="ordinalPositions"),
             ],
         )
+        embedding_skill = self._build_embedding_skill(
+            name="mixed-content-embeddings",
+            context="/document/pages/*",
+            source="/document/pages/*",
+            target_name="chunk_vector",
+        )
         return SearchIndexerSkillset(
             name=skillset_name,
             description="Tenant-scoped skillset for mixed file type chunking.",
-            skills=[extraction_skill, split_skill],
+            skills=[extraction_skill, split_skill, embedding_skill],
             index_projection=self._build_text_index_projection(target_index_name),
         )
 
@@ -539,6 +611,10 @@ class AzureSearchIngestionService:
                         InputFieldMappingEntry(
                             name="content",
                             source="/document/text_sections/*/content",
+                        ),
+                        InputFieldMappingEntry(
+                            name=CONTENT_VECTOR_FIELD_NAME,
+                            source="/document/text_sections/*/chunk_vector",
                         ),
                         InputFieldMappingEntry(
                             name="chunk_ordinal",
@@ -595,6 +671,10 @@ class AzureSearchIngestionService:
                             source="/document/pages/*",
                         ),
                         InputFieldMappingEntry(
+                            name=CONTENT_VECTOR_FIELD_NAME,
+                            source="/document/pages/*/chunk_vector",
+                        ),
+                        InputFieldMappingEntry(
                             name="chunk_ordinal",
                             source="/document/ordinalPositions/*",
                         ),
@@ -637,6 +717,91 @@ class AzureSearchIngestionService:
                 subdomain_url=self.config.ai_services_subdomain_url,
             )
         return None
+
+    def _build_vector_search(self) -> VectorSearch:
+        return VectorSearch(
+            algorithms=[
+                HnswAlgorithmConfiguration(name=VECTOR_SEARCH_ALGORITHM_NAME),
+            ],
+            profiles=[
+                VectorSearchProfile(
+                    name=VECTOR_SEARCH_PROFILE_NAME,
+                    algorithm_configuration_name=VECTOR_SEARCH_ALGORITHM_NAME,
+                    vectorizer_name=VECTOR_SEARCH_VECTORIZER_NAME,
+                )
+            ],
+            vectorizers=[
+                AzureOpenAIVectorizer(
+                    vectorizer_name=VECTOR_SEARCH_VECTORIZER_NAME,
+                    parameters=AzureOpenAIVectorizerParameters(
+                        resource_url=self.config.azure_openai_endpoint,
+                        deployment_name=self.config.azure_openai_embedding_deployment,
+                    ),
+                )
+            ],
+        )
+
+    def _build_embedding_skill(
+        self, name: str, context: str, source: str, target_name: str
+    ) -> AzureOpenAIEmbeddingSkill:
+        return AzureOpenAIEmbeddingSkill(
+            name=name,
+            context=context,
+            resource_url=self.config.azure_openai_endpoint,
+            deployment_name=self.config.azure_openai_embedding_deployment,
+            dimensions=self.config.azure_openai_embedding_dimensions,
+            inputs=[InputFieldMappingEntry(name="text", source=source)],
+            outputs=[
+                OutputFieldMappingEntry(name="embedding", target_name=target_name)
+            ],
+        )
+
+    def _find_incompatible_field_configurations(
+        self, existing_index: SearchIndex, desired_index: SearchIndex
+    ) -> list[str]:
+        existing_by_name = {field.name: field for field in existing_index.fields}
+        desired_by_name = {field.name: field for field in desired_index.fields}
+        mismatches: list[str] = []
+        for field_name, desired_field in desired_by_name.items():
+            existing_field = existing_by_name.get(field_name)
+            if existing_field is None:
+                continue
+            desired_config = self._normalized_model_data(desired_field)
+            existing_config = self._normalized_model_data(existing_field)
+            for property_name, desired_value in desired_config.items():
+                if property_name in {"name", "type"}:
+                    continue
+                if property_name not in existing_config:
+                    mismatches.append(
+                        f"{field_name}: missing property '{property_name}'"
+                    )
+                    continue
+                if existing_config[property_name] != desired_value:
+                    mismatches.append(
+                        f"{field_name}: existing {property_name}={existing_config[property_name]!r} desired={desired_value!r}"
+                    )
+        return mismatches
+
+    def _vector_search_configuration_mismatch(
+        self, existing_index: SearchIndex, desired_index: SearchIndex
+    ) -> bool:
+        return self._normalized_model_data(
+            getattr(existing_index, "vector_search", None)
+        ) != self._normalized_model_data(getattr(desired_index, "vector_search", None))
+
+    def _normalized_model_data(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "_data"):
+            return self._normalized_model_data(getattr(value, "_data"))
+        if isinstance(value, dict):
+            return {
+                key: self._normalized_model_data(item)
+                for key, item in sorted(value.items())
+            }
+        if isinstance(value, list):
+            return [self._normalized_model_data(item) for item in value]
+        return value
 
     def _stamp_blob_metadata(
         self,
