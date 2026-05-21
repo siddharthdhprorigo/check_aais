@@ -111,7 +111,9 @@ def build_service(blob_names=None):
         blob_connection_string="UseDevelopmentStorage=true",
         blob_container_name="docs",
         azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="test-api-key",
         azure_openai_embedding_deployment="embeddings",
+        azure_openai_embedding_model_name="text-embedding-3-small",
         azure_openai_embedding_dimensions=1536,
     )
     indexer_client = FakeIndexerClient()
@@ -205,12 +207,19 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
     assert vector_field.vector_search_profile_name == VECTOR_SEARCH_PROFILE_NAME
     assert tenant_index.vector_search is not None
     assert tenant_index.vector_search.profiles[0].name == VECTOR_SEARCH_PROFILE_NAME
+    vectorizer = tenant_index.vector_search.vectorizers[0]
+    assert vectorizer.parameters.api_key == "test-api-key"
+    assert vectorizer.parameters.deployment_name == "embeddings"
+    assert vectorizer.parameters.model_name == "text-embedding-3-small"
 
     skillset = next(iter(indexer_client.skillsets.values()))
     embedding_skill = next(
         skill for skill in skillset.skills if skill.name == "layout-content-embeddings"
     )
     assert embedding_skill.context == "/document/text_sections/*"
+    assert embedding_skill.api_key == "test-api-key"
+    assert embedding_skill.deployment_name == "embeddings"
+    assert embedding_skill.model_name == "text-embedding-3-small"
     assert embedding_skill.inputs[0].source == "/document/text_sections/*/content"
     assert embedding_skill.outputs[0].target_name == "chunk_vector"
     vector_mapping = next(
@@ -243,6 +252,9 @@ def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
         skill for skill in skillset.skills if skill.name == "text-content-embeddings"
     )
     assert embedding_skill.context == "/document/pages/*"
+    assert embedding_skill.api_key == "test-api-key"
+    assert embedding_skill.deployment_name == "embeddings"
+    assert embedding_skill.model_name == "text-embedding-3-small"
     assert embedding_skill.inputs[0].source == "/document/pages/*"
     assert embedding_skill.outputs[0].target_name == "chunk_vector"
     vector_mapping = next(
@@ -384,6 +396,9 @@ def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
         skill for skill in skillset.skills if skill.name == "mixed-content-embeddings"
     )
     assert embedding_skill.context == "/document/pages/*"
+    assert embedding_skill.api_key == "test-api-key"
+    assert embedding_skill.deployment_name == "embeddings"
+    assert embedding_skill.model_name == "text-embedding-3-small"
     assert embedding_skill.inputs[0].source == "/document/pages/*"
     assert embedding_skill.outputs[0].target_name == "chunk_vector"
     vector_mapping = next(
@@ -464,3 +479,34 @@ def test_load_file_map_from_path(tmp_path):
     loaded = _load_file_map_from_path(str(file_map_path))
 
     assert loaded == {"12345": "invoice.pdf", "98765": "notes.txt"}
+
+
+def test_azure_openai_api_key_is_optional_for_vectorizer_and_embedding_skill():
+    config = AzureSearchIngestionConfig(
+        search_endpoint="https://example.search.windows.net",
+        blob_connection_string="UseDevelopmentStorage=true",
+        blob_container_name="docs",
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key=None,
+        azure_openai_embedding_deployment="embeddings",
+        azure_openai_embedding_model_name="text-embedding-3-small",
+        azure_openai_embedding_dimensions=1536,
+    )
+    service = AzureSearchIngestionService(
+        config,
+        search_indexer_client=FakeIndexerClient(),
+        index_client=FakeIndexClient(),
+        blob_container_client=FakeBlobContainerClient(),
+        credential=object(),
+    )
+
+    vectorizer = service._build_vector_search().vectorizers[0]
+    embedding_skill = service._build_embedding_skill(
+        "embeddings",
+        "/document/pages/*",
+        "/document/pages/*",
+        "chunk_vector",
+    )
+
+    assert vectorizer.parameters.api_key is None
+    assert embedding_skill.api_key is None

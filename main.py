@@ -70,7 +70,9 @@ class AzureSearchIngestionConfig:
     ai_services_key: str | None = None
     ai_services_subdomain_url: str | None = None
     azure_openai_endpoint: str = ""
+    azure_openai_api_key: str | None = None
     azure_openai_embedding_deployment: str = ""
+    azure_openai_embedding_model_name: str = ""
     azure_openai_embedding_dimensions: int = 0
 
     @classmethod
@@ -81,6 +83,10 @@ class AzureSearchIngestionConfig:
         azure_openai_endpoint = _required_env("AZURE_OPENAI_ENDPOINT")
         azure_openai_embedding_deployment = _required_env(
             "AZURE_OPENAI_EMBEDDING_DEPLOYMENT"
+        )
+        azure_openai_embedding_model_name = os.getenv(
+            "AZURE_OPENAI_EMBEDDING_MODEL_NAME",
+            azure_openai_embedding_deployment,
         )
         azure_openai_embedding_dimensions = int(
             _required_env("AZURE_OPENAI_EMBEDDING_DIMENSIONS")
@@ -99,9 +105,7 @@ class AzureSearchIngestionConfig:
             shared_data_source_name=os.getenv(
                 "AZURE_SEARCH_SHARED_DATA_SOURCE_NAME", "kb-shared-blob-ds"
             ),
-            index_name_prefix=os.getenv(
-                "AZURE_SEARCH_INDEX_NAME_PREFIX", "kb-chunks"
-            ),
+            index_name_prefix=os.getenv("AZURE_SEARCH_INDEX_NAME_PREFIX", "kb-chunks"),
             skillset_name_prefix=os.getenv(
                 "AZURE_SEARCH_SKILLSET_PREFIX", "kb-skillset"
             ),
@@ -113,13 +117,13 @@ class AzureSearchIngestionConfig:
             ),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            default_language_code=os.getenv(
-                "AZURE_SEARCH_DEFAULT_LANGUAGE_CODE", "en"
-            ),
+            default_language_code=os.getenv("AZURE_SEARCH_DEFAULT_LANGUAGE_CODE", "en"),
             ai_services_key=os.getenv("AZURE_AI_SERVICES_KEY"),
             ai_services_subdomain_url=os.getenv("AZURE_AI_SERVICES_SUBDOMAIN_URL"),
             azure_openai_endpoint=azure_openai_endpoint,
+            azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_openai_embedding_deployment=azure_openai_embedding_deployment,
+            azure_openai_embedding_model_name=azure_openai_embedding_model_name,
             azure_openai_embedding_dimensions=azure_openai_embedding_dimensions,
         )
 
@@ -142,9 +146,12 @@ class AzureSearchIngestionService:
         self.index_client = index_client or SearchIndexClient(
             self.config.search_endpoint, self.credential
         )
-        self.blob_container_client = blob_container_client or ContainerClient.from_connection_string(
-            self.config.blob_connection_string,
-            self.config.blob_container_name,
+        self.blob_container_client = (
+            blob_container_client
+            or ContainerClient.from_connection_string(
+                self.config.blob_connection_string,
+                self.config.blob_container_name,
+            )
         )
 
     def bootstrap(self) -> dict[str, Any]:
@@ -434,15 +441,18 @@ class AzureSearchIngestionService:
             return
 
         existing_fields = {
-            field.name: str(getattr(field, "type", None)) for field in existing_index.fields
+            field.name: str(getattr(field, "type", None))
+            for field in existing_index.fields
         }
         desired_fields = {
-            field.name: str(getattr(field, "type", None)) for field in desired_index.fields
+            field.name: str(getattr(field, "type", None))
+            for field in desired_index.fields
         }
         incompatible_fields = [
             field_name
             for field_name, desired_type in desired_fields.items()
-            if field_name in existing_fields and existing_fields[field_name] != desired_type
+            if field_name in existing_fields
+            and existing_fields[field_name] != desired_type
         ]
         incompatible_field_configs = self._find_incompatible_field_configurations(
             existing_index, desired_index
@@ -464,7 +474,12 @@ class AzureSearchIngestionService:
             details = ", ".join(incompatible_field_configs)
             if vector_search_mismatch:
                 details = ", ".join(
-                    part for part in [details, "vector_search: existing configuration does not match desired configuration"] if part
+                    part
+                    for part in [
+                        details,
+                        "vector_search: existing configuration does not match desired configuration",
+                    ]
+                    if part
                 )
             raise ValueError(
                 "Tenant index schema is incompatible with the current code. "
@@ -507,9 +522,13 @@ class AzureSearchIngestionService:
                 "maximumLength": self.config.chunk_size,
                 "overlapLength": self.config.chunk_overlap,
             },
-            inputs=[InputFieldMappingEntry(name="file_data", source="/document/file_data")],
+            inputs=[
+                InputFieldMappingEntry(name="file_data", source="/document/file_data")
+            ],
             outputs=[
-                OutputFieldMappingEntry(name="text_sections", target_name="text_sections")
+                OutputFieldMappingEntry(
+                    name="text_sections", target_name="text_sections"
+                )
             ],
         )
         embedding_skill = self._build_embedding_skill(
@@ -564,7 +583,9 @@ class AzureSearchIngestionService:
             description="Extract text from mixed document types before chunking.",
             context="/document",
             data_to_extract="contentAndMetadata",
-            inputs=[InputFieldMappingEntry(name="file_data", source="/document/file_data")],
+            inputs=[
+                InputFieldMappingEntry(name="file_data", source="/document/file_data")
+            ],
             outputs=[
                 OutputFieldMappingEntry(name="content", target_name="extracted_content")
             ],
@@ -578,7 +599,9 @@ class AzureSearchIngestionService:
             maximum_page_length=self.config.chunk_size,
             page_overlap_length=self.config.chunk_overlap,
             inputs=[
-                InputFieldMappingEntry(name="text", source="/document/extracted_content")
+                InputFieldMappingEntry(
+                    name="text", source="/document/extracted_content"
+                )
             ],
             outputs=[
                 OutputFieldMappingEntry(name="textItems", target_name="pages"),
@@ -736,6 +759,8 @@ class AzureSearchIngestionService:
                     parameters=AzureOpenAIVectorizerParameters(
                         resource_url=self.config.azure_openai_endpoint,
                         deployment_name=self.config.azure_openai_embedding_deployment,
+                        model_name=self.config.azure_openai_embedding_model_name,
+                        api_key=self.config.azure_openai_api_key,
                     ),
                 )
             ],
@@ -749,6 +774,8 @@ class AzureSearchIngestionService:
             context=context,
             resource_url=self.config.azure_openai_endpoint,
             deployment_name=self.config.azure_openai_embedding_deployment,
+            model_name=self.config.azure_openai_embedding_model_name,
+            api_key=self.config.azure_openai_api_key,
             dimensions=self.config.azure_openai_embedding_dimensions,
             inputs=[InputFieldMappingEntry(name="text", source=source)],
             outputs=[
@@ -810,9 +837,12 @@ class AzureSearchIngestionService:
         file_map: dict[str, str],
     ) -> None:
         prefix = f"{tenant_id}/{kb_id}/"
-        blob_items = list(self.blob_container_client.list_blobs(name_starts_with=prefix))
+        blob_items = list(
+            self.blob_container_client.list_blobs(name_starts_with=prefix)
+        )
         found_file_ids = {
-            _extract_file_id_from_blob_name(getattr(blob, "name", "")) for blob in blob_items
+            _extract_file_id_from_blob_name(getattr(blob, "name", ""))
+            for blob in blob_items
         }
         expected_file_ids = set(file_map.keys())
         if found_file_ids != expected_file_ids:
@@ -890,17 +920,21 @@ class AzureSearchIngestionService:
         last_result = getattr(status, "last_result", None)
         return {
             "status": getattr(status, "status", None),
-            "last_result": None
-            if last_result is None
-            else {
-                "status": getattr(last_result, "status", None),
-                "start_time": _iso_or_none(getattr(last_result, "start_time", None)),
-                "end_time": _iso_or_none(getattr(last_result, "end_time", None)),
-                "errors": getattr(last_result, "errors", None),
-                "warnings": getattr(last_result, "warnings", None),
-                "items_processed": getattr(last_result, "items_processed", None),
-                "items_failed": getattr(last_result, "items_failed", None),
-            },
+            "last_result": (
+                None
+                if last_result is None
+                else {
+                    "status": getattr(last_result, "status", None),
+                    "start_time": _iso_or_none(
+                        getattr(last_result, "start_time", None)
+                    ),
+                    "end_time": _iso_or_none(getattr(last_result, "end_time", None)),
+                    "errors": getattr(last_result, "errors", None),
+                    "warnings": getattr(last_result, "warnings", None),
+                    "items_processed": getattr(last_result, "items_processed", None),
+                    "items_failed": getattr(last_result, "items_failed", None),
+                }
+            ),
             "execution_history": history,
         }
 

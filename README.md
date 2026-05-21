@@ -109,7 +109,9 @@ AZURE_BLOB_CONNECTION_STRING=
 AZURE_BLOB_CONTAINER_NAME=
 AZURE_SEARCH_SERVICE_ENDPOINT=
 AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=
+AZURE_OPENAI_EMBEDDING_MODEL_NAME=
 AZURE_OPENAI_EMBEDDING_DIMENSIONS=
 ```
 
@@ -130,7 +132,11 @@ AZURE_AI_SERVICES_SUBDOMAIN_URL=
 
 `AZURE_AI_SERVICES_KEY` and `AZURE_AI_SERVICES_SUBDOMAIN_URL` are only needed when your Document Layout skill billing setup uses an attached Azure AI / Foundry resource key.
 
-`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, and `AZURE_OPENAI_EMBEDDING_DIMENSIONS` are required so Azure AI Search can generate and persist chunk embeddings in the tenant index.
+`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_EMBEDDING_MODEL_NAME`, and `AZURE_OPENAI_EMBEDDING_DIMENSIONS` are required so Azure AI Search can generate and persist chunk embeddings in the tenant index.
+
+`AZURE_OPENAI_API_KEY` is optional. When set, Azure AI Search uses that key for the Azure OpenAI vectorizer and embedding skill. When unset, this POC preserves the current non-key auth behavior for those Azure OpenAI calls.
+
+If `AZURE_OPENAI_EMBEDDING_MODEL_NAME` is omitted, this POC falls back to the deployment name for backward compatibility. For newer Azure AI Search API versions, setting the explicit model name is recommended and may be required.
 
 ## Commands
 
