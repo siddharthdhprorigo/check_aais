@@ -97,8 +97,10 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 AZURE_BLOB_CONNECTION_STRING=
 AZURE_BLOB_CONTAINER_NAME=
 AZURE_SEARCH_SERVICE_ENDPOINT=
+AZURE_SEARCH_API_KEY=
 AZURE_OPENAI_ENDPOINT=
 AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_CHAT_DEPLOYMENT=
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT=
 AZURE_OPENAI_EMBEDDING_MODEL_NAME=
 AZURE_OPENAI_EMBEDDING_DIMENSIONS=
@@ -123,6 +125,19 @@ AZURE_SEARCH_DEFAULT_LANGUAGE_CODE=en
 
 If `AZURE_OPENAI_EMBEDDING_MODEL_NAME` is omitted, this POC falls back to the deployment name for backward compatibility. For newer Azure AI Search API versions, setting the explicit model name is recommended and may be required.
 
+For the LangChain agent, set:
+
+```bash
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_CHAT_DEPLOYMENT=
+AZURE_OPENAI_API_VERSION=2024-10-21
+```
+
+`AZURE_OPENAI_DEPLOYMENT` is also accepted as a fallback if you prefer that env name.
+
+The agent uses LangChain's `create_agent(...)` API with `AzureChatOpenAI` and exposes the existing `hybrid_search` retrieval flow as a tool.
+
 ## Commands
 
 Bootstrap shared tenant-independent resources:
@@ -144,6 +159,25 @@ Get ingestion status for a KB:
 
 ```bash
 uv run python main.py status --tenant-id tenant-123 --kb-id kb-456
+```
+
+Run the LangChain agent:
+
+```bash
+uv run python agent.py \
+  --tenant-id tenant-123 \
+  --kb-id kb-456 \
+  --question "What does the invoice say about payment terms?"
+```
+
+Show the full LangChain message and tool trace:
+
+```bash
+uv run python agent.py \
+  --tenant-id tenant-123 \
+  --kb-id kb-456 \
+  --question "Summarize the onboarding policy" \
+  --show-trace
 ```
 
 ## Python usage
