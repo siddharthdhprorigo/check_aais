@@ -14,18 +14,16 @@ where the blob name is the `file_id`, not the original filename.
 
 - One dedicated chunk index per tenant
 - One shared blob data source definition
-- Tenant-scoped skillsets created lazily on first ingestion for that tenant
-- KB-scoped runtime data sources and indexers for each ingestion request
+- One tenant-scoped skillset created lazily on first ingestion for that tenant
+- One tenant-scoped runtime data source and indexer reused for every KB ingestion request for that tenant
 - Blob metadata stamping before indexing so Azure AI Search can ingest `filename`, `file_id`, `tenant_id`, and `kb_id`
 - Azure OpenAI-powered vector embeddings persisted per chunk in the tenant index
 
 All KBs for the same tenant land in the same tenant index.
 
-Because blob names are extensionless `file_id` values, the service chooses the Azure AI Search pipeline from the real filenames in `file_map`.
+Because blob names are extensionless `file_id` values, the service validates supported file types from the real filenames in `file_map`.
 
-- layout family: `.pdf`, `.docx`, `.html`
-- text family: `.txt`, `.md`
-- mixed layout and text families use a mixed extraction pipeline in Azure AI Search
+- supported file types: `.pdf`, `.docx`, `.html`, `.txt`, `.md`
 
 ## Input contract
 
@@ -46,11 +44,9 @@ Start ingestion with:
 
 The service treats this map as authoritative for the KB ingestion request.
 
-All files in a single request must belong to the same Azure AI Search pipeline family:
+All files in a single request must use supported extensions:
 
-- layout family: `.pdf`, `.docx`, `.html`
-- text family: `.txt`, `.md`
-- mixed family: any combination across those two sets, handled through `DocumentExtractionSkill -> SplitSkill`
+- `.pdf`, `.docx`, `.html`, `.txt`, `.md`
 
 Before Azure AI Search runs, it verifies that the blobs under:
 
@@ -67,19 +63,12 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 
 ## Processing strategy
 
-- `PDF`, `DOCX`, and `HTML`
-  - Parsed by Azure AI Search using `DocumentIntelligenceLayoutSkill`
-  - Chunked by Azure AI Search using fixed-size overlap-aware text sections
-  - Preserves `page_number` when Azure returns `locationMetadata`
-
-- `TXT` and `MD`
-  - Parsed by the blob indexer
-  - Chunked by Azure AI Search using `SplitSkill`
-
-- Mixed `PDF`/`DOCX`/`HTML` with `TXT`/`MD`
-  - Parsed by Azure AI Search using `DocumentExtractionSkill`
-  - Chunked by Azure AI Search using `SplitSkill`
-  - Trades away page metadata in favor of supporting mixed file types in one KB ingestion
+- All supported file types use one tenant-scoped Azure AI Search built-in pipeline
+  - Parsed by `DocumentExtractionSkill`
+  - Chunked by `SplitSkill`
+  - Embedded by `AzureOpenAIEmbeddingSkill`
+  - The tenant indexer scans the tenant prefix and can pick up any changed blobs under that tenant
+  - `page_number` and `chunk_ordinal` are nullable and not guaranteed to be populated in this mode
 
 ## Vector search readiness
 
@@ -97,8 +86,8 @@ exactly match the provided `file_map` keys, and then stamps each blob with metad
 - `filename`
 - `blob_path`
 - `file_id`
-- `chunk_ordinal`
-- `page_number` when available
+- `chunk_ordinal` nullable / best-effort
+- `page_number` nullable / best-effort
 - `source_type`
 - `content_vector`
 
@@ -126,11 +115,7 @@ AZURE_SEARCH_DATA_SOURCE_PREFIX=kb-ingestion
 AZURE_SEARCH_CHUNK_SIZE=2000
 AZURE_SEARCH_CHUNK_OVERLAP=500
 AZURE_SEARCH_DEFAULT_LANGUAGE_CODE=en
-AZURE_AI_SERVICES_KEY=
-AZURE_AI_SERVICES_SUBDOMAIN_URL=
 ```
-
-`AZURE_AI_SERVICES_KEY` and `AZURE_AI_SERVICES_SUBDOMAIN_URL` are only needed when your Document Layout skill billing setup uses an attached Azure AI / Foundry resource key.
 
 `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_EMBEDDING_MODEL_NAME`, and `AZURE_OPENAI_EMBEDDING_DIMENSIONS` are required so Azure AI Search can generate and persist chunk embeddings in the tenant index.
 

@@ -12,7 +12,6 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.search.documents.indexes import SearchIndexClient, SearchIndexerClient
 from azure.search.documents.indexes.models import (
-    AIServicesAccountKey,
     AzureOpenAIEmbeddingSkill,
     AzureOpenAIVectorizer,
     AzureOpenAIVectorizerParameters,
@@ -39,15 +38,13 @@ from azure.search.documents.indexes.models import (
     SplitSkill,
     VectorSearch,
     VectorSearchProfile,
-    DocumentIntelligenceLayoutSkill,
 )
 from azure.storage.blob import ContainerClient
 from dotenv import load_dotenv
 
 load_dotenv()
 
-LAYOUT_FILE_EXTENSIONS = {".pdf", ".docx", ".html"}
-TEXT_FILE_EXTENSIONS = {".txt", ".md"}
+SUPPORTED_FILE_EXTENSIONS = {".pdf", ".docx", ".html", ".txt", ".md"}
 CONTENT_VECTOR_FIELD_NAME = "content_vector"
 VECTOR_SEARCH_PROFILE_NAME = "content-vector-profile"
 VECTOR_SEARCH_ALGORITHM_NAME = "content-vector-hnsw"
@@ -176,17 +173,12 @@ class AzureSearchIngestionService:
     ) -> dict[str, Any]:
         normalized_tenant = _validate_identifier("tenant_id", tenant_id)
         normalized_kb = _validate_identifier("kb_id", kb_id)
-        blob_prefix = f"{normalized_tenant}/{normalized_kb}"
         normalized_file_map = _validate_file_map(file_map)
-        pipeline = _select_ingestion_pipeline(normalized_file_map)
+        _validate_supported_file_extensions(normalized_file_map)
         tenant_resources = self._tenant_resource_names(normalized_tenant)
         tenant_index_name = tenant_resources["index_name"]
         self._ensure_tenant_index(tenant_index_name)
-        active_skillset_name = self._ensure_pipeline_skillset(
-            pipeline,
-            tenant_resources,
-            tenant_index_name,
-        )
+        active_skillset_name = self._ensure_skillset(tenant_resources, tenant_index_name)
         self._stamp_blob_metadata(
             normalized_tenant,
             normalized_kb,
@@ -194,9 +186,6 @@ class AzureSearchIngestionService:
         )
         runtime_resources = self._build_runtime_resources(
             normalized_tenant,
-            normalized_kb,
-            blob_prefix,
-            pipeline=pipeline,
             tenant_index_name=tenant_index_name,
             active_skillset_name=active_skillset_name,
         )
@@ -212,10 +201,10 @@ class AzureSearchIngestionService:
         return {
             "tenant_id": normalized_tenant,
             "kb_id": normalized_kb,
-            "blob_prefix": blob_prefix,
+            "blob_prefix": f"{normalized_tenant}/{normalized_kb}",
             "index_name": tenant_index_name,
             "file_count": len(normalized_file_map),
-            "pipeline": pipeline,
+            "pipeline": "tenant_unified",
             "indexer_names": [item["indexer"].name for item in runtime_resources],
             "started_at": started_at,
             "status": "accepted",
@@ -224,21 +213,15 @@ class AzureSearchIngestionService:
     def get_ingestion_status(self, tenant_id: str, kb_id: str) -> dict[str, Any]:
         normalized_tenant = _validate_identifier("tenant_id", tenant_id)
         normalized_kb = _validate_identifier("kb_id", kb_id)
-        names = self._runtime_resource_names(normalized_tenant, normalized_kb)
+        names = self._runtime_resource_names(normalized_tenant)
 
-        statuses: list[dict[str, Any]] = []
-        for doc_group, indexer_name in (
-            ("layout", names["layout_indexer_name"]),
-            ("text", names["text_indexer_name"]),
-            ("mixed", names["mixed_indexer_name"]),
-        ):
-            statuses.append(
-                {
-                    "document_group": doc_group,
-                    "indexer_name": indexer_name,
-                    **self._read_indexer_status(indexer_name),
-                }
-            )
+        statuses = [
+            {
+                "document_group": "tenant_unified",
+                "indexer_name": names["indexer_name"],
+                **self._read_indexer_status(names["indexer_name"]),
+            }
+        ]
 
         return {
             "tenant_id": normalized_tenant,
@@ -261,60 +244,25 @@ class AzureSearchIngestionService:
     def _build_runtime_resources(
         self,
         tenant_id: str,
-        kb_id: str,
-        blob_prefix: str,
         *,
-        pipeline: str,
         tenant_index_name: str,
         active_skillset_name: str,
     ) -> list[dict[str, Any]]:
-        names = self._runtime_resource_names(tenant_id, kb_id)
-        if pipeline == "layout":
-            return [
-                {
-                    "kind": "layout",
-                    "data_source": self._build_runtime_data_source(
-                        names["layout_data_source_name"], blob_prefix
-                    ),
-                    "indexer": self._build_runtime_indexer(
-                        names["layout_indexer_name"],
-                        names["layout_data_source_name"],
-                        active_skillset_name,
-                        tenant_index_name,
-                        allow_skillset_to_read_file_data=True,
-                    ),
-                }
-            ]
-        if pipeline == "mixed":
-            return [
-                {
-                    "kind": "mixed",
-                    "data_source": self._build_runtime_data_source(
-                        names["mixed_data_source_name"], blob_prefix
-                    ),
-                    "indexer": self._build_runtime_indexer(
-                        names["mixed_indexer_name"],
-                        names["mixed_data_source_name"],
-                        active_skillset_name,
-                        tenant_index_name,
-                        allow_skillset_to_read_file_data=True,
-                    ),
-                }
-            ]
+        names = self._runtime_resource_names(tenant_id)
         return [
             {
-                "kind": "text",
+                "kind": "tenant_unified",
                 "data_source": self._build_runtime_data_source(
-                    names["text_data_source_name"], blob_prefix
+                    names["data_source_name"], f"{tenant_id}/"
                 ),
                 "indexer": self._build_runtime_indexer(
-                    names["text_indexer_name"],
-                    names["text_data_source_name"],
+                    names["indexer_name"],
+                    names["data_source_name"],
                     active_skillset_name,
                     tenant_index_name,
-                    allow_skillset_to_read_file_data=False,
+                    allow_skillset_to_read_file_data=True,
                 ),
-            },
+            }
         ]
 
     def _build_runtime_data_source(
@@ -489,98 +437,22 @@ class AzureSearchIngestionService:
 
         self.index_client.create_or_update_index(desired_index)
 
-    def _ensure_pipeline_skillset(
+    def _ensure_skillset(
         self,
-        pipeline: str,
         tenant_resources: dict[str, str],
         tenant_index_name: str,
     ) -> str:
-        if pipeline == "layout":
-            skillset_name = tenant_resources["layout_skillset_name"]
-            skillset = self._build_layout_skillset(skillset_name, tenant_index_name)
-        elif pipeline == "mixed":
-            skillset_name = tenant_resources["mixed_skillset_name"]
-            skillset = self._build_mixed_skillset(skillset_name, tenant_index_name)
-        else:
-            skillset_name = tenant_resources["text_skillset_name"]
-            skillset = self._build_text_skillset(skillset_name, tenant_index_name)
+        skillset_name = tenant_resources["skillset_name"]
+        skillset = self._build_unified_skillset(skillset_name, tenant_index_name)
         self.search_indexer_client.create_or_update_skillset(skillset)
         return skillset_name
 
-    def _build_layout_skillset(
-        self, skillset_name: str, target_index_name: str
-    ) -> SearchIndexerSkillset:
-        layout_skill = DocumentIntelligenceLayoutSkill(
-            name="layout-document-parser",
-            description="Extract and chunk PDF/DOCX content with location metadata.",
-            context="/document",
-            output_mode="oneToMany",
-            output_format="text",
-            extraction_options=["locationMetadata"],
-            chunking_properties={
-                "unit": "characters",
-                "maximumLength": self.config.chunk_size,
-                "overlapLength": self.config.chunk_overlap,
-            },
-            inputs=[
-                InputFieldMappingEntry(name="file_data", source="/document/file_data")
-            ],
-            outputs=[
-                OutputFieldMappingEntry(
-                    name="text_sections", target_name="text_sections"
-                )
-            ],
-        )
-        embedding_skill = self._build_embedding_skill(
-            name="layout-content-embeddings",
-            context="/document/text_sections/*",
-            source="/document/text_sections/*/content",
-            target_name="chunk_vector",
-        )
-        return SearchIndexerSkillset(
-            name=skillset_name,
-            description="Tenant-scoped skillset for PDF/DOCX parsing and chunking.",
-            skills=[layout_skill, embedding_skill],
-            index_projection=self._build_layout_index_projection(target_index_name),
-            cognitive_services_account=self._build_cognitive_services_account(),
-        )
-
-    def _build_text_skillset(
-        self, skillset_name: str, target_index_name: str
-    ) -> SearchIndexerSkillset:
-        split_skill = SplitSkill(
-            name="split-text-documents",
-            description="Chunk TXT/MD/HTML content with overlap.",
-            context="/document",
-            default_language_code=self.config.default_language_code,
-            text_split_mode="pages",
-            maximum_page_length=self.config.chunk_size,
-            page_overlap_length=self.config.chunk_overlap,
-            inputs=[InputFieldMappingEntry(name="text", source="/document/content")],
-            outputs=[
-                OutputFieldMappingEntry(name="textItems", target_name="pages"),
-                OutputFieldMappingEntry(name="ordinalPositions"),
-            ],
-        )
-        embedding_skill = self._build_embedding_skill(
-            name="text-content-embeddings",
-            context="/document/pages/*",
-            source="/document/pages/*",
-            target_name="chunk_vector",
-        )
-        return SearchIndexerSkillset(
-            name=skillset_name,
-            description="Tenant-scoped skillset for TXT/MD/HTML chunking.",
-            skills=[split_skill, embedding_skill],
-            index_projection=self._build_text_index_projection(target_index_name),
-        )
-
-    def _build_mixed_skillset(
+    def _build_unified_skillset(
         self, skillset_name: str, target_index_name: str
     ) -> SearchIndexerSkillset:
         extraction_skill = DocumentExtractionSkill(
-            name="extract-mixed-document-text",
-            description="Extract text from mixed document types before chunking.",
+            name="extract-document-text",
+            description="Extract text from supported document types before chunking.",
             context="/document",
             data_to_extract="contentAndMetadata",
             inputs=[
@@ -591,8 +463,8 @@ class AzureSearchIngestionService:
             ],
         )
         split_skill = SplitSkill(
-            name="split-mixed-document-text",
-            description="Chunk extracted text for mixed document ingestion.",
+            name="split-document-text",
+            description="Chunk extracted text for tenant-scoped ingestion.",
             context="/document",
             default_language_code=self.config.default_language_code,
             text_split_mode="pages",
@@ -605,81 +477,22 @@ class AzureSearchIngestionService:
             ],
             outputs=[
                 OutputFieldMappingEntry(name="textItems", target_name="pages"),
-                OutputFieldMappingEntry(name="ordinalPositions"),
             ],
         )
         embedding_skill = self._build_embedding_skill(
-            name="mixed-content-embeddings",
+            name="content-embeddings",
             context="/document/pages/*",
             source="/document/pages/*",
             target_name="chunk_vector",
         )
         return SearchIndexerSkillset(
             name=skillset_name,
-            description="Tenant-scoped skillset for mixed file type chunking.",
+            description="Tenant-scoped built-in skillset for mixed file type chunking.",
             skills=[extraction_skill, split_skill, embedding_skill],
-            index_projection=self._build_text_index_projection(target_index_name),
+            index_projection=self._build_unified_index_projection(target_index_name),
         )
 
-    def _build_layout_index_projection(
-        self, target_index_name: str
-    ) -> SearchIndexerIndexProjection:
-        return SearchIndexerIndexProjection(
-            selectors=[
-                SearchIndexerIndexProjectionSelector(
-                    target_index_name=target_index_name,
-                    parent_key_field_name="parent_id",
-                    source_context="/document/text_sections/*",
-                    mappings=[
-                        InputFieldMappingEntry(
-                            name="content",
-                            source="/document/text_sections/*/content",
-                        ),
-                        InputFieldMappingEntry(
-                            name=CONTENT_VECTOR_FIELD_NAME,
-                            source="/document/text_sections/*/chunk_vector",
-                        ),
-                        InputFieldMappingEntry(
-                            name="chunk_ordinal",
-                            source="/document/text_sections/*/locationMetadata/ordinalPosition",
-                        ),
-                        InputFieldMappingEntry(
-                            name="page_number",
-                            source="/document/text_sections/*/locationMetadata/pageNumber",
-                        ),
-                        InputFieldMappingEntry(
-                            name="filename",
-                            source="/document/filename",
-                        ),
-                        InputFieldMappingEntry(
-                            name="blob_path",
-                            source="/document/metadata_storage_path",
-                        ),
-                        InputFieldMappingEntry(
-                            name="source_type",
-                            source="/document/metadata_storage_content_type",
-                        ),
-                        InputFieldMappingEntry(
-                            name="tenant_id",
-                            source="/document/tenant_id",
-                        ),
-                        InputFieldMappingEntry(
-                            name="kb_id",
-                            source="/document/kb_id",
-                        ),
-                        InputFieldMappingEntry(
-                            name="file_id",
-                            source="/document/file_id",
-                        ),
-                    ],
-                )
-            ],
-            parameters=SearchIndexerIndexProjectionsParameters(
-                projection_mode=IndexProjectionMode.SKIP_INDEXING_PARENT_DOCUMENTS
-            ),
-        )
-
-    def _build_text_index_projection(
+    def _build_unified_index_projection(
         self, target_index_name: str
     ) -> SearchIndexerIndexProjection:
         return SearchIndexerIndexProjection(
@@ -698,10 +511,6 @@ class AzureSearchIngestionService:
                             source="/document/pages/*/chunk_vector",
                         ),
                         InputFieldMappingEntry(
-                            name="chunk_ordinal",
-                            source="/document/ordinalPositions/*",
-                        ),
-                        InputFieldMappingEntry(
                             name="filename",
                             source="/document/filename",
                         ),
@@ -726,20 +535,12 @@ class AzureSearchIngestionService:
                             source="/document/file_id",
                         ),
                     ],
-                )
+                ),
             ],
             parameters=SearchIndexerIndexProjectionsParameters(
                 projection_mode=IndexProjectionMode.SKIP_INDEXING_PARENT_DOCUMENTS
             ),
         )
-
-    def _build_cognitive_services_account(self) -> AIServicesAccountKey | None:
-        if self.config.ai_services_key and self.config.ai_services_subdomain_url:
-            return AIServicesAccountKey(
-                key=self.config.ai_services_key,
-                subdomain_url=self.config.ai_services_subdomain_url,
-            )
-        return None
 
     def _build_vector_search(self) -> VectorSearch:
         return VectorSearch(
@@ -873,28 +674,14 @@ class AzureSearchIngestionService:
         tenant_slug = _make_tenant_slug(tenant_id)
         return {
             "index_name": f"{self.config.index_name_prefix}-{tenant_slug}",
-            "layout_skillset_name": (
-                f"{self.config.skillset_name_prefix}-layout-{tenant_slug}"
-            ),
-            "text_skillset_name": (
-                f"{self.config.skillset_name_prefix}-text-{tenant_slug}"
-            ),
-            "mixed_skillset_name": (
-                f"{self.config.skillset_name_prefix}-mixed-{tenant_slug}"
-            ),
+            "skillset_name": f"{self.config.skillset_name_prefix}-{tenant_slug}",
         }
 
-    def _runtime_resource_names(self, tenant_id: str, kb_id: str) -> dict[str, str]:
-        slug = _make_resource_slug(tenant_id, kb_id)
+    def _runtime_resource_names(self, tenant_id: str) -> dict[str, str]:
+        slug = _make_tenant_slug(tenant_id)
         return {
-            "layout_data_source_name": (
-                f"{self.config.data_source_name_prefix}-layout-{slug}"
-            ),
-            "text_data_source_name": f"{self.config.data_source_name_prefix}-text-{slug}",
-            "mixed_data_source_name": f"{self.config.data_source_name_prefix}-mixed-{slug}",
-            "layout_indexer_name": f"{self.config.indexer_name_prefix}-layout-{slug}",
-            "text_indexer_name": f"{self.config.indexer_name_prefix}-text-{slug}",
-            "mixed_indexer_name": f"{self.config.indexer_name_prefix}-mixed-{slug}",
+            "data_source_name": f"{self.config.data_source_name_prefix}-{slug}",
+            "indexer_name": f"{self.config.indexer_name_prefix}-{slug}",
         }
 
     def _read_indexer_status(self, indexer_name: str) -> dict[str, Any]:
@@ -968,28 +755,19 @@ def _validate_file_map(file_map: dict[str, str]) -> dict[str, str]:
     return normalized
 
 
-def _select_ingestion_pipeline(file_map: dict[str, str]) -> str:
+def _validate_supported_file_extensions(file_map: dict[str, str]) -> None:
     file_extensions = {
         _extract_file_extension(file_name) for file_name in file_map.values()
     }
     unsupported = sorted(
-        ext
-        for ext in file_extensions
-        if ext not in LAYOUT_FILE_EXTENSIONS and ext not in TEXT_FILE_EXTENSIONS
+        ext for ext in file_extensions if ext not in SUPPORTED_FILE_EXTENSIONS
     )
     if unsupported:
         raise ValueError(
             "Unsupported file extensions in file_map: "
             f"{unsupported}. Supported extensions are "
-            f"{sorted(LAYOUT_FILE_EXTENSIONS | TEXT_FILE_EXTENSIONS)}."
+            f"{sorted(SUPPORTED_FILE_EXTENSIONS)}."
         )
-
-    has_layout_files = any(ext in LAYOUT_FILE_EXTENSIONS for ext in file_extensions)
-    has_text_files = any(ext in TEXT_FILE_EXTENSIONS for ext in file_extensions)
-    if has_layout_files and has_text_files:
-        return "mixed"
-    return "layout" if has_layout_files else "text"
-
 
 def _extract_file_id_from_blob_name(blob_name: str) -> str:
     return blob_name.rstrip("/").rsplit("/", 1)[-1]

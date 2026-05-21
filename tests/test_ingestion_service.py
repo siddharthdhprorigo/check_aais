@@ -157,7 +157,7 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
     assert result["blob_prefix"] == "tenant-a/kb-b"
     assert result["index_name"] in index_client.indexes
     assert result["file_count"] == 2
-    assert result["pipeline"] == "layout"
+    assert result["pipeline"] == "tenant_unified"
     assert len(result["indexer_names"]) == 1
     assert set(result["indexer_names"]) == set(indexer_client.ran_indexers)
 
@@ -166,7 +166,7 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
         for name, data_source in indexer_client.data_sources.items()
     }
     assert len(data_source_queries) == 1
-    assert all(query == "tenant-a/kb-b" for query in data_source_queries.values())
+    assert all(query == "tenant-a/" for query in data_source_queries.values())
 
     assert len(indexer_client.skillsets) == 1
     assert blob_container_client.metadata_updates == [
@@ -190,14 +190,9 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
         ),
     ]
 
-    layout_indexer = next(
-        indexer
-        for name, indexer in indexer_client.indexers.items()
-        if "layout" in name
-    )
-
-    assert layout_indexer.target_index_name == result["index_name"]
-    assert layout_indexer.parameters.configuration.allow_skillset_to_read_file_data is True
+    indexer = next(iter(indexer_client.indexers.values()))
+    assert indexer.target_index_name == result["index_name"]
+    assert indexer.parameters.configuration.allow_skillset_to_read_file_data is True
     tenant_index = index_client.indexes[result["index_name"]]
     vector_field = next(
         field for field in tenant_index.fields if field.name == CONTENT_VECTOR_FIELD_NAME
@@ -213,24 +208,17 @@ def test_start_ingestion_creates_tenant_index_and_scopes_to_kb_prefix():
     assert vectorizer.parameters.model_name == "text-embedding-3-small"
 
     skillset = next(iter(indexer_client.skillsets.values()))
+    assert len(skillset.skills) == 3
     embedding_skill = next(
-        skill for skill in skillset.skills if skill.name == "layout-content-embeddings"
+        skill for skill in skillset.skills if skill.name == "content-embeddings"
     )
-    assert embedding_skill.context == "/document/text_sections/*"
-    assert embedding_skill.api_key == "test-api-key"
-    assert embedding_skill.deployment_name == "embeddings"
-    assert embedding_skill.model_name == "text-embedding-3-small"
-    assert embedding_skill.inputs[0].source == "/document/text_sections/*/content"
-    assert embedding_skill.outputs[0].target_name == "chunk_vector"
-    vector_mapping = next(
-        mapping
-        for mapping in skillset.index_projection.selectors[0].mappings
-        if mapping.name == CONTENT_VECTOR_FIELD_NAME
-    )
-    assert vector_mapping.source == "/document/text_sections/*/chunk_vector"
+    assert embedding_skill.context == "/document/pages/*"
+    assert embedding_skill.inputs[0].source == "/document/pages/*"
+    selector = skillset.index_projection.selectors[0]
+    assert selector.source_context == "/document/pages/*"
 
 
-def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
+def test_start_ingestion_uses_unified_pipeline_for_text_only_kb():
     service, _, indexer_client, index_client, _ = build_service(
         blob_names=["tenant-a/kb-text/11111", "tenant-a/kb-text/22222"]
     )
@@ -241,15 +229,15 @@ def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
         {"11111": "notes.txt", "22222": "summary.md"},
     )
 
-    assert result["pipeline"] == "text"
+    assert result["pipeline"] == "tenant_unified"
     assert result["index_name"] in index_client.indexes
     assert len(result["indexer_names"]) == 1
-    text_indexer = next(iter(indexer_client.indexers.values()))
-    assert text_indexer.target_index_name == result["index_name"]
-    assert text_indexer.parameters.configuration.allow_skillset_to_read_file_data is False
+    indexer = next(iter(indexer_client.indexers.values()))
+    assert indexer.target_index_name == result["index_name"]
+    assert indexer.parameters.configuration.allow_skillset_to_read_file_data is True
     skillset = next(iter(indexer_client.skillsets.values()))
     embedding_skill = next(
-        skill for skill in skillset.skills if skill.name == "text-content-embeddings"
+        skill for skill in skillset.skills if skill.name == "content-embeddings"
     )
     assert embedding_skill.context == "/document/pages/*"
     assert embedding_skill.api_key == "test-api-key"
@@ -257,10 +245,11 @@ def test_start_ingestion_uses_text_pipeline_for_text_only_kb():
     assert embedding_skill.model_name == "text-embedding-3-small"
     assert embedding_skill.inputs[0].source == "/document/pages/*"
     assert embedding_skill.outputs[0].target_name == "chunk_vector"
+    assert len(skillset.skills) == 3
+    text_selector = skillset.index_projection.selectors[0]
+    assert text_selector.source_context == "/document/pages/*"
     vector_mapping = next(
-        mapping
-        for mapping in skillset.index_projection.selectors[0].mappings
-        if mapping.name == CONTENT_VECTOR_FIELD_NAME
+        mapping for mapping in text_selector.mappings if mapping.name == CONTENT_VECTOR_FIELD_NAME
     )
     assert vector_mapping.source == "/document/pages/*/chunk_vector"
 
@@ -279,6 +268,8 @@ def test_second_kb_for_same_tenant_reuses_same_tenant_index():
     assert first["index_name"] == second["index_name"]
     assert len(index_client.indexes) == 1
     assert len(indexer_client.skillsets) == 1
+    assert len(indexer_client.indexers) == 1
+    assert len(indexer_client.data_sources) == 1
 
 
 def test_different_tenants_get_different_indexes():
@@ -370,7 +361,7 @@ def test_start_ingestion_fails_when_file_map_does_not_match_kb_blobs():
     assert indexer_client.ran_indexers == []
 
 
-def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
+def test_start_ingestion_uses_unified_pipeline_for_layout_and_text_files():
     service, _, indexer_client, index_client, blob_container_client = build_service(
         blob_names=[
             "tenant-a/kb-a/12345",
@@ -384,29 +375,11 @@ def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
         {"12345": "doc.pdf", "98765": "notes.txt"},
     )
 
-    assert result["pipeline"] == "mixed"
+    assert result["pipeline"] == "tenant_unified"
     assert result["index_name"] in index_client.indexes
     assert len(result["indexer_names"]) == 1
     assert len(indexer_client.ran_indexers) == 1
-    mixed_indexer = next(iter(indexer_client.indexers.values()))
-    assert "mixed" in mixed_indexer.name
-    assert mixed_indexer.parameters.configuration.allow_skillset_to_read_file_data is True
-    skillset = next(iter(indexer_client.skillsets.values()))
-    embedding_skill = next(
-        skill for skill in skillset.skills if skill.name == "mixed-content-embeddings"
-    )
-    assert embedding_skill.context == "/document/pages/*"
-    assert embedding_skill.api_key == "test-api-key"
-    assert embedding_skill.deployment_name == "embeddings"
-    assert embedding_skill.model_name == "text-embedding-3-small"
-    assert embedding_skill.inputs[0].source == "/document/pages/*"
-    assert embedding_skill.outputs[0].target_name == "chunk_vector"
-    vector_mapping = next(
-        mapping
-        for mapping in skillset.index_projection.selectors[0].mappings
-        if mapping.name == CONTENT_VECTOR_FIELD_NAME
-    )
-    assert vector_mapping.source == "/document/pages/*/chunk_vector"
+    assert len(indexer_client.skillsets) == 1
     assert blob_container_client.metadata_updates == [
         (
             "tenant-a/kb-a/12345",
@@ -427,6 +400,33 @@ def test_start_ingestion_uses_mixed_pipeline_for_layout_and_text_files():
             },
         ),
     ]
+
+
+def test_start_ingestion_accepts_full_supported_extension_set():
+    service, _, _, _, _ = build_service(
+        blob_names=[
+            "tenant-a/kb-all/1",
+            "tenant-a/kb-all/2",
+            "tenant-a/kb-all/3",
+            "tenant-a/kb-all/4",
+            "tenant-a/kb-all/5",
+        ]
+    )
+
+    result = service.start_ingestion(
+        "tenant-a",
+        "kb-all",
+        {
+            "1": "doc.pdf",
+            "2": "report.docx",
+            "3": "page.html",
+            "4": "notes.txt",
+            "5": "summary.md",
+        },
+    )
+
+    assert result["pipeline"] == "tenant_unified"
+    assert result["file_count"] == 5
 
 
 def test_get_ingestion_status_reads_azure_search_status_only():
@@ -460,7 +460,7 @@ def test_get_ingestion_status_reads_azure_search_status_only():
         item["indexer_name"]: item["status"] for item in result["indexers"]
     }
     assert found[active_indexer_name] == "inProgress"
-    assert list(found.values()).count("not_found") == 2
+    assert list(found.values()).count("not_found") == 0
 
 
 def test_get_ingestion_status_reports_missing_indexers():
@@ -469,6 +469,7 @@ def test_get_ingestion_status_reports_missing_indexers():
     result = service.get_ingestion_status("tenant-a", "kb-b")
 
     assert result["status"] == "not_found"
+    assert len(result["indexers"]) == 1
     assert all(item["status"] == "not_found" for item in result["indexers"])
 
 
